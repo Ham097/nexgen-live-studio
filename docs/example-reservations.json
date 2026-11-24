@@ -1,0 +1,17 @@
+{
+  "schema": "nexgen.live_studio.reservations.v1",
+  "reservations": [
+    {
+      "reservation_id": "fictional-reservation-1",
+      "student_id": "fictional-student-1",
+      "name": "Maya Ellis",
+      "level": "B1",
+      "updated_at": "2030-01-25T10:00:00+03:00",
+      "start_at": "2030-01-26T16:00:00+03:00",
+      "end_at": "2030-01-26T16:40:00+03:00",
+      "status": "confirmed",
+      "mission_id": "fictional-compare-travel",
+      "meet_url": null
+    }
+  ]
+}

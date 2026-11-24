@@ -1,0 +1,136 @@
+{
+  "audio": "Windows SAPI synthetic speech and digital silence",
+  "system": "Windows",
+  "processor": "Intel64 Family 6 Model 183 Stepping 1, GenuineIntel",
+  "runs": [
+    {
+      "model": "base.en",
+      "device": "cpu",
+      "load_seconds": 0.89,
+      "cases": [
+        {
+          "fixture": "answer",
+          "audio_seconds": 10.935,
+          "median_seconds": 0.699,
+          "word_errors": 0,
+          "reference_words": 30,
+          "recognized_words": 30,
+          "text": "I would choose the train because I can work during the journey. On the other hand, the plane is faster. If we had more time, we could visit another city."
+        },
+        {
+          "fixture": "beginner",
+          "audio_seconds": 2.2,
+          "median_seconds": 0.6,
+          "word_errors": 0,
+          "reference_words": 3,
+          "recognized_words": 3,
+          "text": "Yes, I can."
+        },
+        {
+          "fixture": "hesitation",
+          "audio_seconds": 4.36,
+          "median_seconds": 0.607,
+          "word_errors": 0,
+          "reference_words": 7,
+          "recognized_words": 7,
+          "text": "I think, we should take the train."
+        },
+        {
+          "fixture": "silence",
+          "audio_seconds": 3.0,
+          "median_seconds": 0.005,
+          "word_errors": 0,
+          "reference_words": 0,
+          "recognized_words": 0,
+          "text": ""
+        }
+      ]
+    },
+    {
+      "model": "large-v3-turbo",
+      "device": "cuda",
+      "load_seconds": 4.811,
+      "cases": [
+        {
+          "fixture": "answer",
+          "audio_seconds": 10.935,
+          "median_seconds": 0.333,
+          "word_errors": 0,
+          "reference_words": 30,
+          "recognized_words": 30,
+          "text": "I would choose the train because I can work during the journey. On the other hand, the plane is faster. If we had more time, we could visit another city."
+        },
+        {
+          "fixture": "beginner",
+          "audio_seconds": 2.2,
+          "median_seconds": 0.233,
+          "word_errors": 0,
+          "reference_words": 3,
+          "recognized_words": 3,
+          "text": "Yes, I can."
+        },
+        {
+          "fixture": "hesitation",
+          "audio_seconds": 4.36,
+          "median_seconds": 0.254,
+          "word_errors": 0,
+          "reference_words": 7,
+          "recognized_words": 7,
+          "text": "I think, we should take the train."
+        },
+        {
+          "fixture": "silence",
+          "audio_seconds": 3.0,
+          "median_seconds": 0.005,
+          "word_errors": 0,
+          "reference_words": 0,
+          "recognized_words": 0,
+          "text": ""
+        }
+      ]
+    },
+    {
+      "model": "distil-large-v3",
+      "device": "cuda",
+      "load_seconds": 2.571,
+      "cases": [
+        {
+          "fixture": "answer",
+          "audio_seconds": 10.935,
+          "median_seconds": 0.272,
+          "word_errors": 0,
+          "reference_words": 30,
+          "recognized_words": 30,
+          "text": "I would choose the train because I can work during the journey. On the other hand, the plane is faster. If we had more time, we could visit another city."
+        },
+        {
+          "fixture": "beginner",
+          "audio_seconds": 2.2,
+          "median_seconds": 0.212,
+          "word_errors": 0,
+          "reference_words": 3,
+          "recognized_words": 3,
+          "text": "Yes, I can."
+        },
+        {
+          "fixture": "hesitation",
+          "audio_seconds": 4.36,
+          "median_seconds": 0.226,
+          "word_errors": 0,
+          "reference_words": 7,
+          "recognized_words": 7,
+          "text": "I think, we should take the train."
+        },
+        {
+          "fixture": "silence",
+          "audio_seconds": 3.0,
+          "median_seconds": 0.004,
+          "word_errors": 0,
+          "reference_words": 0,
+          "recognized_words": 0,
+          "text": ""
+        }
+      ]
+    }
+  ]
+}
