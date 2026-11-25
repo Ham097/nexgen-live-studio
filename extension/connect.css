@@ -1,0 +1,5 @@
+:root { font: 14px system-ui, sans-serif; color: #211a36; background: #faf7ff; }
+body { width: 245px; padding: 17px; margin: 0; }
+h1 { font-size: 19px; margin: 0 0 8px; }
+p { margin: 0; line-height: 1.5; }
+button { background: #6534d8; color: #fff; border: 0; border-radius: 7px; padding: 8px 14px; margin-top: 10px; }

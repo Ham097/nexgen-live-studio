@@ -3,6 +3,7 @@ STYLE = """
 QWidget { background: #f7f7fc; color: #201a35; }
 QFrame[panel="true"] { background: #ffffff; border: 1px solid #e9e5f2; border-radius: 16px; }
 QFrame[panel="true"] QLabel, QFrame[panel="true"] QWidget[transparent="true"] { background: transparent; }
+QFrame#meetHome { background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #ede4ff, stop:1 #f3f0ff); border-color: #e0d4f7; }
 QLabel[role="title"] { font-size: 31px; font-weight: 700; }
 QLabel[role="section"] { font-size: 18px; font-weight: 700; }
 QLabel[role="eyebrow"] { font-size: 11px; font-weight: 700; letter-spacing: 1px; color: #6641bc; }

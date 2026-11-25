@@ -2,10 +2,11 @@
   "manifest_version": 3,
   "name": "NexGen Live Studio · Meet Audio",
   "description": "Connect a single, explicitly selected Google Meet tab to NexGen Live Studio on this computer.",
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxl0Wp1a80ba5rJSk0gVkPuEbymAAAcOMxbdEU8Ri9DUwQKddrO9X/lp6I9zEMxom73sU2a4t6KfJVH1gSAVoEQV3jr6AQcHtuP4UFsG2NbAOg/cpVZgB9red/l65qi8VfL+KRnSg4Ce/s+uhYWiSAQCOW/B+GzyeSkj7+WGvSRtzuAjsTcxU6KDitoluWDPsrGOsDhms0e/CJ/NaDLtgtUkXZ29IARBRhlK4Ko1DS3vElXnb4RRSucbvFLQR3/h9VJ9hKDbmaQyaWSeygEUKI6a5/w00b+1Jo9XczzZp1PXF2nKsBkbW2y69ZpSjwY99Q/XkQcGwaNakOrjaeCkPKwIDAQAB",
   "minimum_chrome_version": "116",
-  "permissions": ["activeTab", "offscreen", "storage", "tabCapture"],
-  "host_permissions": ["http://127.0.0.1/*"],
+  "permissions": ["activeTab", "offscreen", "storage", "tabCapture", "nativeMessaging", "alarms"],
+  "host_permissions": ["http://127.0.0.1/*", "https://meet.google.com/*"],
   "background": {"service_worker": "worker.js"},
-  "action": {"default_title": "NexGen Live Studio", "default_popup": "popup.html"}
+  "action": {"default_title": "Allow this Meet tab in NexGen Live Studio", "default_popup": "connect.html"}
 }

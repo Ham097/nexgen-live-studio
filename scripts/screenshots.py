@@ -29,7 +29,7 @@ def main():
         window.resize(min(1440, available.width()), min(900, available.height()))
         window.show()
         window.open_lesson(lesson)
-        for page, name in (("Home", "lesson-desk"), ("Live Studio", "live-studio"),
+        for page, name in (("Home", "lesson-desk"), ("Solo test", "solo-test"), ("Live Studio", "live-studio"),
                            ("Review", "transcript-review"), ("Lesson Summary", "lesson-summary")):
             window.navigate(page)
             if page == "Review":

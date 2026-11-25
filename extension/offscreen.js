@@ -85,7 +85,7 @@ async function connect({token, meeting, streamId}) {
 chrome.runtime.onMessage.addListener((request, sender, respond) => {
   if (sender.id !== chrome.runtime.id || request.target !== "offscreen") return;
   if (request.action === "status") {
-    respond({message: active?.stream ? "Meet tab connected" : "Disconnected"});
+    respond({connected: Boolean(active?.stream), message: active?.stream ? "Meet audio connected" : ""});
     return;
   }
   const operation = request.action === "disconnect" ? disconnect() : connect(request);

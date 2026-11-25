@@ -8,6 +8,7 @@ import secrets
 from struct import unpack_from
 from threading import Event, RLock, Thread
 from time import monotonic, sleep
+import unicodedata
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -16,10 +17,28 @@ import soxr
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.server import serve
 
+from .chrome import ORIGIN
+
 RATE = 16000
 PORT = 18763
 FRAME_MS = 100
 GATE = 0.008
+MEET_CODE = re.compile(r"[a-z]{3}-[a-z]{4}-[a-z]{3}")
+
+
+def physical_mic(name):
+    name = "".join(char for char in unicodedata.normalize("NFKD", name.casefold().replace("ı", "i"))
+                   if not unicodedata.combining(char))
+    return not any(marker in name for marker in ("stereo mix", "stereo karisimi", "stereomix",
+                                                  "cable output", "virtual", "what u hear", "loopback",
+                                                  "wave out mix", "mezcla estereo", "mixage stereo"))
+
+
+def microphone_order(default, choices, preferred):
+    physical = [device for device in choices if physical_mic(device["name"])]
+    selected = [device for device in choices if preferred and device["name"] == preferred]
+    automatic = sorted(physical or choices, key=lambda device: device["index"] != default)
+    return selected + [device for device in automatic if device not in selected]
 
 
 @dataclass
@@ -62,14 +81,24 @@ class Capture:
         self.server = None
         self.bridge_error = ""
         self.peer = None
+        self.discoveries = {}
+        self.focus = (0, None)
+        self.speaker = None
+        self.solo_text = deque(maxlen=40)
+        self.solo_voice = False
+        self.mic_task = None
         self.worker = Thread(target=self._decode, daemon=True, name="Studio inference")
         self.worker.start()
 
     def snapshot(self):
         with self.lock:
             tick = monotonic()
+            visible = [rooms for updated, rooms in self.discoveries.values() if tick - updated < 6]
             return {"mode": self.mode, "tab": self.connected, "meeting": self.meeting,
+                    "chrome": bool(visible), "rooms": sorted(set().union(*visible)),
                     "mic": self.mic is not None, "mic_error": self.mic_error,
+                    "mic_name": self.mic, "speaker_name": self.speaker,
+                    "solo_text": " ".join(self.solo_text), "solo_voice": self.solo_voice,
                     "bridge_error": self.bridge_error, "failure": self.failure, "pending": self.pending,
                     "preview": self.preview_text, "revision": self.revision,
                     **{key: level if tick - self.latest[key] < .3 else 0.
@@ -82,7 +111,11 @@ class Capture:
         Thread(target=self.server.serve_forever, daemon=True, name="Meet audio bridge").start()
 
     def _connection(self, ws):
-        if urlsplit(ws.request.path).path != "/capture/v1":
+        route = urlsplit(ws.request.path).path
+        if route == "/discover/v2":
+            self._discover(ws)
+            return
+        if route != "/capture/v1":
             ws.close(1008, "Unknown route")
             return
         bridge_started = False
@@ -91,7 +124,7 @@ class Capture:
             token = request.get("token")
             meeting = request.get("meet")
             if (not isinstance(token, str) or not secrets.compare_digest(token, self.token)
-                    or not isinstance(meeting, str) or not re.fullmatch(r"[a-z]{3}-[a-z]{4}-[a-z]{3}", meeting)):
+                    or not isinstance(meeting, str) or not MEET_CODE.fullmatch(meeting)):
                 ws.close(1008, "Pairing rejected")
                 return
             with self.lock:
@@ -109,7 +142,7 @@ class Capture:
             last_frame = monotonic()
             while not self.closed.is_set():
                 with self.lock:
-                    state = (self.generation, self.mode != "paused")
+                    state = (self.generation, self.mode in ("assessment", "transcript"))
                 if state != previous:
                     ws.send(json.dumps({"generation": state[0], "capture": state[1]}))
                     previous, last_sequence, student_tick = state, None, None
@@ -151,8 +184,49 @@ class Capture:
             if bridge_started:
                 with self.lock:
                     self.connected, self.meeting, self.peer = False, None, None
-                    if self.mode != "paused":
+                    if self.mode in ("assessment", "transcript"):
                         self.pause("Meet tab disconnected. Reconnect it before resuming.")
+
+    def _discover(self, ws):
+        if ws.request.headers.get("Origin") != ORIGIN:
+            ws.close(1008, "Use the NexGen extension")
+            return
+        try:
+            key = json.loads(ws.recv(timeout=4)).get("token")
+            if not isinstance(key, str) or not secrets.compare_digest(key, self.token):
+                ws.close(1008, "Local key rejected")
+                return
+            with self.lock:
+                seen = self.focus[0]
+            while not self.closed.is_set():
+                try:
+                    message = json.loads(ws.recv(timeout=.25))
+                except TimeoutError:
+                    message = None
+                if message is not None:
+                    rooms = message.get("rooms")
+                    if (not isinstance(rooms, list) or len(rooms) > 60
+                            or any(not isinstance(room, str) or not MEET_CODE.fullmatch(room) for room in rooms)):
+                        ws.close(1008, "Invalid Meet list")
+                        break
+                    with self.lock:
+                        self.discoveries[ws] = (monotonic(), set(rooms))
+                with self.lock:
+                    ticket, room = self.focus
+                    attached = self.discoveries.get(ws)
+                if ticket != seen:
+                    seen = ticket
+                    if attached and room in attached[1]:
+                        ws.send(json.dumps({"focus": room}))
+        except (ConnectionClosed, TimeoutError, ValueError, AttributeError, TypeError):
+            pass
+        finally:
+            with self.lock:
+                self.discoveries.pop(ws, None)
+
+    def focus_meeting(self, room):
+        with self.lock:
+            self.focus = (self.focus[0] + 1, room)
 
     def select_meeting(self, code, reset=False):
         peer = None
@@ -166,15 +240,21 @@ class Capture:
             Thread(target=peer.close, args=(1008, "Changed reservation"), daemon=True).start()
 
     def start(self, sample_id, mode, offset_ms=0):
-        if mode not in ("assessment", "transcript"):
-            raise ValueError("Choose assessment or transcript only.")
+        if mode not in ("assessment", "transcript", "solo"):
+            raise ValueError("Choose a capture mode.")
         with self.lock:
-            if not self.recognizer or not self.connected or not self.mic:
-                raise ValueError("Wait for the speech model, Meet tab and teacher microphone.")
-            if monotonic() - self.latest["student"] > 2:
-                raise ValueError("The Meet tab is connected but its audio bridge is inactive.")
-            if self.expected_meeting and self.expected_meeting != self.meeting:
-                raise ValueError("Connect the Meet tab for the selected reservation.")
+            if not self.recognizer or not self.mic:
+                raise ValueError("Wait for transcription and the microphone to be ready.")
+            if mode == "solo":
+                if self.mode != "paused" or self.pending:
+                    raise ValueError("Finish the current recording before testing.")
+                self.solo_text.clear()
+                self.solo_voice = False
+            else:
+                if not self.connected or monotonic() - self.latest["student"] > 2:
+                    raise ValueError("Allow audio for the Meet tab to continue.")
+                if self.expected_meeting and self.expected_meeting != self.meeting:
+                    raise ValueError("Allow audio for the Meet tab for this lesson.")
             self._flush()
             self.generation += 1
             self.offset = max(offset_ms, self.last_ms if self.sample_id == sample_id else 0)
@@ -220,7 +300,8 @@ class Capture:
 
     def feed(self, speaker, generation, audio, end_tick):
         with self.lock:
-            if self.mode == "paused" or generation != self.generation or self.closed.is_set():
+            if (self.mode == "paused" or (self.mode == "solo" and speaker != "teacher")
+                    or generation != self.generation or self.closed.is_set()):
                 return
             stamp = self.offset + max(0, round((end_tick - self.clock) * 1000))
             self.last_ms = max(self.last_ms, stamp)
@@ -228,6 +309,8 @@ class Capture:
             self.levels[speaker] = min(1., level * 5)
             self.latest[speaker] = monotonic()
             voiced = level > GATE
+            if self.mode == "solo" and voiced:
+                self.solo_voice = True
             if voiced:
                 self.speech.append((self.epoch, speaker, stamp - FRAME_MS, stamp))
             while len(self.speech) > 2000:
@@ -237,7 +320,8 @@ class Capture:
                 state.chunks.append(audio)
                 state.silent = 0 if voiced else state.silent + FRAME_MS
                 duration = len(state.chunks) * FRAME_MS
-                if not state.preview and speaker == "student" and duration >= 3000 and not state.silent:
+                if (not state.preview and (speaker == "student" or self.mode == "solo")
+                        and duration >= 2200 and not state.silent):
                     state.preview = True
                     self._submit(speaker, True)
                 if state.silent >= 600 or duration >= 10000:
@@ -269,6 +353,11 @@ class Capture:
                     with self.lock:
                         if epoch == self.epoch and self.mode != "paused":
                             self.preview_text = " ".join(text for text, _, flags in segments if not flags)
+                    continue
+                if mode == "solo":
+                    with self.lock:
+                        self.solo_text.extend(text for text, _, _ in segments)
+                        self.preview_text = ""
                     continue
                 for text, words, flags in segments:
                     if self.closed.is_set():
@@ -310,11 +399,24 @@ class Capture:
                 device for device in choices if device["hostApi"] == wasapi["index"]
                 and device["maxInputChannels"] and not device["isLoopbackDevice"]]
 
+    @classmethod
+    def default_endpoints(cls, preferred):
+        import pyaudiowpatch as pa
+        default, choices = cls.enumerate_mics()
+        ordered = microphone_order(default, choices, preferred)
+        with pa.PyAudio() as devices:
+            try:
+                speaker = devices.get_default_wasapi_device(d_out=True)["name"]
+            except (ValueError, OSError):
+                speaker = None
+        return (ordered[0]["name"] if ordered else None), speaker
+
     def microphone_worker(self, preferred=None):
         self.stop_mic()
         stop = Event()
         self.mic_stop = stop
-        Thread(target=self._microphone, args=(stop, preferred), daemon=True, name="WASAPI microphone").start()
+        self.mic_task = Thread(target=self._microphone, args=(stop, preferred), daemon=True, name="WASAPI microphone")
+        self.mic_task.start()
 
     def stop_mic(self):
         if getattr(self, "mic_stop", None):
@@ -328,16 +430,25 @@ class Capture:
         import pyaudiowpatch as pa
         try:
             default, choices = self.enumerate_mics()
-            device = next((item for item in choices if item["name"] == preferred), None)
-            if device is None:
-                device = next((item for item in choices if item["index"] == default), None)
-            if device is None:
-                raise OSError("No Windows microphone is available.")
-            rate = int(device["defaultSampleRate"])
-            channels = min(2, int(device["maxInputChannels"]))
             with pa.PyAudio() as card:
-                stream = card.open(rate=rate, channels=channels, input=True, format=pa.paInt16,
-                                   input_device_index=device["index"], frames_per_buffer=rate // 10)
+                try:
+                    speaker = card.get_default_wasapi_device(d_out=True)["name"]
+                except (OSError, ValueError):
+                    speaker = None
+                with self.lock:
+                    if not stop.is_set():
+                        self.speaker = speaker
+                for device in microphone_order(default, choices, preferred):
+                    rate = int(device["defaultSampleRate"])
+                    channels = min(2, int(device["maxInputChannels"]))
+                    try:
+                        stream = card.open(rate=rate, channels=channels, input=True, format=pa.paInt16,
+                                           input_device_index=device["index"], frames_per_buffer=rate // 10, start=False)
+                        break
+                    except (OSError, ValueError):
+                        continue
+                else:
+                    raise OSError("No usable Windows microphone. Check Windows microphone access.")
                 try:
                     with self.lock:
                         if stop.is_set():
@@ -347,14 +458,26 @@ class Capture:
                     previous = None
                     remaining = np.empty(0, dtype=np.float32)
                     tick = None
+                    streaming = False
                     while not stop.is_set() and not self.closed.is_set():
                         with self.lock:
                             generation = self.generation
                             active = self.mode != "paused"
+                        if not active:
+                            if streaming:
+                                stream.stop_stream()
+                                streaming = False
+                            resampler, previous, tick = None, None, None
+                            remaining = np.empty(0, dtype=np.float32)
+                            stop.wait(.04)
+                            continue
+                        if not streaming:
+                            stream.start_stream()
+                            streaming = True
                         data = stream.read(rate // 10, exception_on_overflow=True)
                         arrived = monotonic()
                         with self.lock:
-                            if stop.is_set() or generation != self.generation or not active:
+                            if stop.is_set() or generation != self.generation:
                                 # Drop a frame if its acquisition crossed the recording boundary.
                                 resampler, previous, tick = None, None, None
                                 remaining = np.empty(0, dtype=np.float32)

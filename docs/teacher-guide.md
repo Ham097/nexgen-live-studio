@@ -2,9 +2,11 @@
 
 ## Before a lesson
 
-Open **Home**. A confirmed current reservation appears first when it is unambiguous. When a schedule has overlapping reservations, select the learner explicitly. For an unscheduled lesson, enter the same stable learner ID you used before to keep the student's passport together. Confirm identity and consent, including the use of local transcription.
+Open **Home**. Studio checks the microphone, speakers and local model while it looks for open Meet tabs. Choose **Connect Meet** to bring the intended call forward. Click the pinned Live Studio icon in Chrome, then confirm the learner and consent in Studio. Choose an existing learner to keep their evidence together. The schedule and previous lessons are under **Show saved lessons and schedule**.
 
-The Windows default microphone is selected initially. Apply a different input in Settings if needed. The app opens the mic after you open a consented draft. On Chrome's Meet tab, connect the pinned extension using the pairing code copied from the app. A new app launch creates a new pairing code. Tab audio serves as the student channel for a one-to-one call. Other people heard in that same tab require manual exclusion.
+Automatic input selection prefers a physical microphone and skips inputs like Stereo Mix and virtual cables. Apply a specific input in Settings if needed. The microphone stream starts with a recording or solo mic test. Tab audio serves as the student channel for a one-to-one call. Other people heard in that same tab require manual exclusion.
+
+For a check without another person, use **Test on my own**. Start the microphone test and speak one sentence. The meter shows input and the words appear after a short pause. **Play a test sentence** checks Windows playback and transcription independently of the microphone.
 
 ## During the lesson
 

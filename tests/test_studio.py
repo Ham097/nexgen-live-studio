@@ -13,7 +13,8 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 from websockets.sync.client import connect
 
 from studio.analysis import tokens
-from studio.capture import Capture, RATE
+from studio.capture import Capture, RATE, microphone_order
+from studio.chrome import ORIGIN
 from studio.integrations import legacy_export, reservation_rows, suggested, sync_due, upcoming
 from studio.store import Store
 
@@ -228,3 +229,36 @@ class CaptureTests(TestCase):
             self.assertTrue(json.loads(bridge.recv(timeout=2))["capture"])
             self.assertTrue(wait_for(lambda: self.capture.snapshot()["mode"] == "paused"))
             self.assertIn("stopped", self.capture.snapshot()["failure"])
+
+    def test_automatic_audio_prefers_a_real_microphone(self):
+        devices = [{"index": 1, "name": "Stereo Karışımı (Realtek Audio)"},
+                   {"index": 2, "name": "CABLE Output (VB-Audio Virtual Cable)"},
+                   {"index": 3, "name": "Intel Microphone Array"}]
+        self.assertEqual(microphone_order(1, devices, None), [devices[2]])
+        self.assertEqual(microphone_order(1, devices, devices[1]["name"]), [devices[1], devices[2]])
+
+    def test_solo_works_without_meet_and_never_writes_to_a_lesson(self):
+        self.capture.start(None, "solo")
+        generation = self.capture.generation
+        for _ in range(5):
+            self.capture.feed("student", generation, np.full(RATE // 10, .5), monotonic())
+            self.capture.feed("teacher", generation, np.full(RATE // 10, .10), monotonic())
+        self.capture.pause()
+        self.assertTrue(wait_for(lambda: self.capture.snapshot()["pending"] == 0))
+        self.assertEqual(self.capture.snapshot()["solo_text"], "Teacher speech")
+        self.assertTrue(self.capture.snapshot()["solo_voice"])
+        self.assertEqual(self.store.load(self.session)["samples"][0]["turns"], [])
+
+    def test_discovery_authentication_and_focus_do_not_start_capture(self):
+        endpoint = self.url.replace("/capture/v1", "/discover/v2")
+        with connect(endpoint, origin=self.origin) as rejected:
+            with self.assertRaises(ConnectionClosed):
+                rejected.recv(timeout=2)
+        with connect(endpoint, origin=ORIGIN) as browser:
+            browser.send(json.dumps({"token": self.capture.token}))
+            browser.send(json.dumps({"rooms": ["abc-defg-hij"]}))
+            self.assertTrue(wait_for(lambda: self.capture.snapshot()["rooms"] == ["abc-defg-hij"]))
+            self.assertEqual(self.capture.snapshot()["mode"], "paused")
+            self.assertFalse(self.capture.snapshot()["tab"])
+            self.capture.focus_meeting("abc-defg-hij")
+            self.assertEqual(json.loads(browser.recv(timeout=2)), {"focus": "abc-defg-hij"})

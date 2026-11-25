@@ -84,7 +84,8 @@ def scroll(widget):
 def heading(kicker, title, note):
     panel, contents = column(spacing=5)
     for text, role in ((kicker, "eyebrow"), (title, "title"), (note, "muted")):
-        contents.addWidget(label(text, role, wrap=True))
+        if text:
+            contents.addWidget(label(text, role, wrap=True))
     return panel
 
 

@@ -5,17 +5,20 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import subprocess
 from threading import Thread
 import webbrowser
+from uuid import uuid4
 
 from PySide6.QtCore import QEvent, QTimer, Qt, Signal
 from PySide6.QtGui import QKeySequence
 from PySide6.QtWidgets import (QAbstractSpinBox, QApplication, QButtonGroup, QComboBox, QDialog, QFileDialog,
-    QFormLayout, QFrame, QHBoxLayout, QKeySequenceEdit, QLineEdit, QListWidget, QMainWindow, QMessageBox,
+    QFormLayout, QFrame, QHBoxLayout, QInputDialog, QKeySequenceEdit, QLineEdit, QListWidget, QMainWindow, QMessageBox,
     QPlainTextEdit, QProgressBar, QPushButton, QSpinBox, QSplitter, QStackedWidget, QTextBrowser, QVBoxLayout, QWidget)
 
 from .analysis import ACTIVITIES, LEVELS, OUTCOMES, report
 from .asr import MODELS, Recognizer
+from .chrome import register
 from .integrations import get_reservations, https_endpoint, legacy_export, meet_code, reservation_rows, suggested, sync_due, upcoming
 from .linguistics import warm as warm_language
 from .store import doc, profile
@@ -33,14 +36,17 @@ def clock(value):
     return datetime.fromisoformat(value).astimezone().strftime("%d %b · %H:%M")
 
 
+PAGES = ("Home", "Live Studio", "Review", "Lesson Summary", "Settings", "Solo test")
+
+
 class Studio(QMainWindow):
     background = Signal(str, object, object)
 
     def __init__(self, store, capture, data, root, demo=False):
         super().__init__()
         self.setWindowTitle("NexGen Live Studio")
-        self.resize(1360, 850)
-        self.setMinimumSize(870, 670)
+        self.resize(1180, 795)
+        self.setMinimumSize(850, 640)
         self.store, self.capture, self.data, self.root = store, capture, data, root
         self.demo = demo
         self.session_id = self.sample_id = self.lesson = None
@@ -55,8 +61,13 @@ class Studio(QMainWindow):
         self.hotkeys = []
         self.shortcut_alert = ""
         self.bound_meet = None
+        self.bridge_status = ""
+        self.solo_requested = False
+        self.pending_meet = None
+        self.detected_mic = None
         self.background.connect(self.background_done)
         self._layout()
+        self.lesson_navigation()
         self.home_refresh()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.poll)
@@ -72,8 +83,13 @@ class Studio(QMainWindow):
             self.model_status = "Audio disabled for fictional demo"
         else:
             self.register_hotkeys()
+            self.background_job("chrome", lambda: register(self.data, self.root))
             self.background_job("language", warm_language)
-            self.load_model()
+            self.apply_mic()
+            self.load_model(automatic=True)
+            self.mic_retry = QTimer(self)
+            self.mic_retry.timeout.connect(self.recover_mic)
+            self.mic_retry.start(3500)
             QTimer.singleShot(1000, self.fetch_reservations)
         QTimer.singleShot(2000, self.sync)
 
@@ -93,19 +109,23 @@ class Studio(QMainWindow):
         self.stack = QStackedWidget()
         for name, build in (("Home", self.build_home), ("Live Studio", self.build_studio),
                             ("Review", self.build_review), ("Lesson Summary", self.build_summary),
-                            ("Settings", self.build_settings)):
+                            ("Settings", self.build_settings), ("Solo test", self.build_solo)):
             entry = button(name, lambda _, page=name: self.navigate(page))
             entry.setCheckable(True)
             entry.setProperty("nav", True)
             self.nav.addButton(entry, self.stack.count())
             self.stack.addWidget(build())
-            left.addWidget(entry)
+            if name != "Solo test":
+                left.addWidget(entry)
+            else:
+                entry.hide()
         self.nav.button(0).setChecked(True)
         left.addStretch()
         left.addWidget(label("CAPTURE STATUS", "eyebrow"))
         self.rail_status = label("Paused", "muted", True)
         left.addWidget(self.rail_status)
-        left.addWidget(button("Floating toolbar", self.show_toolbar))
+        self.toolbar_shortcut = button("Floating toolbar", self.show_toolbar)
+        left.addWidget(self.toolbar_shortcut)
         left.addWidget(label("Fictional demo" if self.demo else "Private · stored on this PC", "muted", True))
         body.addWidget(rail)
         body.addWidget(self.stack, 1)
@@ -127,7 +147,9 @@ class Studio(QMainWindow):
         return super().eventFilter(widget, event)
 
     def navigate(self, page):
-        index = ("Home", "Live Studio", "Review", "Lesson Summary", "Settings").index(page)
+        if page != "Solo test" and self.capture.snapshot()["mode"] == "solo":
+            self.capture.pause()
+        index = PAGES.index(page)
         self.nav.button(index).setChecked(True)
         self.stack.setCurrentIndex(index)
         if index == 0:
@@ -137,6 +159,11 @@ class Studio(QMainWindow):
         elif index == 4:
             self.update_diagnostics()
 
+    def lesson_navigation(self):
+        for index in (1, 2, 3):
+            self.nav.button(index).setVisible(bool(self.lesson))
+        self.toolbar_shortcut.setVisible(bool(self.lesson))
+
     @staticmethod
     def page(kicker, title, note):
         panel, contents = column(margins=26, spacing=14)
@@ -144,12 +171,33 @@ class Studio(QMainWindow):
         return panel, contents
 
     def build_home(self):
-        panel, layout = self.page("TEACHER WORKSPACE", "Lesson desk", "Prepare your next lesson or pick up where you left off.")
+        panel, layout = self.page("", "Ready to teach?", "Connect to a Meet lesson or check your sound on your own.")
+        pair, actions = column(QHBoxLayout(), spacing=14)
+        self.meet_home_state = label("Looking for Google Meet…", "muted", True)
+        self.meet_action = button("Find Google Meet", self.meet_flow, True)
+        meet = card(label("Google Meet lesson", "section"), self.meet_home_state, row(self.meet_action, None))
+        meet.setObjectName("meetHome")
+        self.solo_home_state = label("Use your microphone or play a short sample.", "muted", True)
+        solo = card(label("Test on my own", "section"), self.solo_home_state,
+                    row(button("Open solo test", lambda: self.navigate("Solo test")), None))
+        actions.addWidget(meet, 1)
+        actions.addWidget(solo, 1)
+        layout.addWidget(pair)
+        self.audio_home = label("", "muted", True)
+        self.model_home = label("", "muted", True)
+        self.model_retry = button("Retry transcription setup", lambda: self.load_model(automatic=True))
+        self.model_retry.hide()
+        layout.addWidget(card(label("Readiness", "section"), self.audio_home,
+                              row(self.model_home, self.model_retry, None)))
+        self.schedule_switch = button("Show saved lessons and schedule", self.show_history)
+        self.schedule_switch.setCheckable(True)
+        layout.addWidget(row(self.schedule_switch, None))
+        self.home_history, history = column()
         self.suggestion = label("Checking upcoming lessons…", "section", True)
         self.suggestion_detail = label("", "muted", True)
         self.prepare = button("Prepare lesson", self.prepare_suggested, True)
-        layout.addWidget(card(self.suggestion, self.suggestion_detail,
-                              row(self.prepare, button("Start unscheduled lesson", self.unscheduled), None)))
+        history.addWidget(card(self.suggestion, self.suggestion_detail,
+                               row(self.prepare, button("Prepare unscheduled lesson", self.unscheduled), None)))
         lists = QSplitter()
         self.upcoming_list = QListWidget()
         self.upcoming_list.setAccessibleName("Upcoming reservations")
@@ -164,16 +212,63 @@ class Studio(QMainWindow):
                             row(button("Open selected", self.open_recent),
                                 button("Delete selected", self.delete_recent), None)))
         lists.setSizes([500, 500])
-        layout.addWidget(lists, 1)
-        self.home_readiness = label("", "muted", True)
-        layout.addWidget(self.home_readiness)
-        return panel
+        lists.setMinimumHeight(250)
+        history.addWidget(lists)
+        self.home_history.hide()
+        layout.addWidget(self.home_history)
+        layout.addStretch()
+        return scroll(panel)
+
+    def show_history(self, visible):
+        self.home_history.setVisible(visible)
+        self.schedule_switch.setText("Hide saved lessons and schedule" if visible else "Show saved lessons and schedule")
+
+    def build_solo(self):
+        panel, layout = self.page("", "Test on my own", "Check your microphone, speakers and transcription before a lesson.")
+        self.solo_mic_status = label("Finding your microphone…", "muted", True)
+        self.solo_meter = QProgressBar()
+        self.solo_meter.setRange(0, 100)
+        self.solo_meter.setTextVisible(False)
+        self.solo_meter.setAccessibleName("Microphone level")
+        self.solo_trigger = button("Start microphone test", self.toggle_solo, True)
+        self.reference_trigger = button("Play a test sentence", self.test_speakers)
+        layout.addWidget(card(label("Microphone", "section"), self.solo_mic_status, self.solo_meter,
+                              row(self.solo_trigger, None)))
+        self.solo_feedback = label("Try saying “I can hear you clearly today.”", "muted", True)
+        self.solo_transcript = label("Your words will appear here.", "value", True)
+        layout.addWidget(card(label("What Studio heard", "section"), self.solo_transcript, self.solo_feedback))
+        self.reference_status = label("Hear a short computer-generated sentence through your speakers.", "muted", True)
+        layout.addWidget(card(label("Speakers and transcription", "section"), self.reference_status,
+                              row(self.reference_trigger, None)))
+        layout.addWidget(row(button("Back to Home", lambda: self.navigate("Home")), None))
+        layout.addStretch()
+        return scroll(panel)
+
+    def toggle_solo(self):
+        state = self.capture.snapshot()
+        if state["mode"] == "solo":
+            self.capture.pause()
+        elif not self.demo and not self.sample_id and state["mode"] == "paused" and not state["pending"]:
+            try:
+                self.capture.start(None, "solo")
+                self.solo_requested = True
+            except ValueError as error:
+                self.solo_feedback.setText(str(error))
+        self.poll()
+
+    def test_speakers(self):
+        from .solo import reference
+        engine = self.capture.recognizer
+        if (engine and self.capture.snapshot()["mode"] == "paused" and not self.capture.snapshot()["pending"]
+                and self.background_job("reference", lambda: reference(self.root, engine))):
+            self.reference_status.setText("Playing and transcribing the test sentence…")
+            self.poll()
 
     def session_heading(self):
         self.student_header = label("Open a lesson from Home", "section", True)
         self.session_info = label("", "muted", True)
         return card(self.student_header, self.session_info,
-                    row(button("Open Google Meet", self.open_meet), button("Copy pairing code", self.copy_code),
+                    row(button("Find / open Meet", self.meet_flow),
                         button("Student presentation", self.present), None))
 
     def build_studio(self):
@@ -186,10 +281,14 @@ class Studio(QMainWindow):
         self.mode = combo(["Active assessment", "Transcript only"])
         self.mode.setAccessibleName("Capture mode")
         self.mode.currentIndexChanged.connect(self.change_mode)
-        self.trigger = button("Start sample", self.toggle, True)
-        self.finish_button = button("Finish sample", self.finish)
-        layout.addWidget(card(row(self.capture_state, None, self.activity, self.mode, self.trigger, self.finish_button),
-                              self.capture_help))
+        self.trigger = button("Start recording", self.toggle, True)
+        self.finish_button = button("Finish", self.finish)
+        self.record_options = row(label("Activity"), self.activity, label("Capture mode"), self.mode, None)
+        options = button("Options", self.record_options.setVisible)
+        options.setCheckable(True)
+        self.record_options.hide()
+        layout.addWidget(card(row(self.capture_state, None, self.trigger, self.finish_button, options),
+                              self.capture_help, self.record_options))
         metrics_panel, numbers = column(QHBoxLayout(), spacing=10)
         self.metrics = []
         for title in ("PACE · WPM", "FLOW · WORDS/RUN", "VOCABULARY", "GRAMMAR · CONFIRMED", "ERRORS / 100"):
@@ -201,7 +300,7 @@ class Studio(QMainWindow):
         self.live_turns = QListWidget()
         self.live_turns.setAccessibleName("Live transcript")
         self.live_turns.itemDoubleClicked.connect(lambda _: self.open_live_turn())
-        self.live_teacher = checked("Include teacher speech")
+        self.live_teacher = checked("Show my microphone")
         self.live_teacher.toggled.connect(self.refresh_transcript)
         self.provisional = label("", "muted", True)
         self.provisional.hide()
@@ -308,9 +407,8 @@ class Studio(QMainWindow):
                              row(self.model_choice, self.compute,
                                  button("Download / load model", lambda: self.load_model(True)), None)))
         items.addWidget(card(label("Google Meet connection", "section"),
-                             label("In Chrome, enable Developer mode at chrome://extensions, choose Load unpacked and select the extension folder. On the Meet tab, open the extension and paste the pairing code.", "muted", True),
-                             row(button("Open extension folder", self.open_extension),
-                                 button("Copy pairing code", self.copy_code), None)))
+                             label("Load the bundled connector once. When Chrome asks for access to a Meet tab, click the Live Studio icon.", "muted", True),
+                             row(button("Set up Chrome", self.chrome_setup), None)))
         self.hot_toggle = QKeySequenceEdit(QKeySequence(self.store.settings("hot_toggle", "F8")))
         self.hot_finish = QKeySequenceEdit(QKeySequence(self.store.settings("hot_finish", "F9")))
         for widget in (self.hot_toggle, self.hot_finish):
@@ -370,7 +468,7 @@ class Studio(QMainWindow):
     def unscheduled(self):
         self.identity({})
 
-    def identity(self, item):
+    def identity(self, item, room=None, start=False):
         reservation = bool(item)
         adapter = item.get("_adapter")
         source = "demo" if self.demo else "nexgen" if adapter else "local"
@@ -388,24 +486,57 @@ class Studio(QMainWindow):
         identity = line("Stable student ID", item.get("student_id", ""))
         level = combo(LEVELS)
         level.setCurrentText(item.get("level", "B1"))
-        meet = line("Optional Google Meet link", item.get("meet_url", "") or "")
+        meet = line("Optional Google Meet link", item.get("meet_url") or (f"https://meet.google.com/{room}" if room else ""))
         mission = line("Optional mission ID", item.get("mission_id", "") or "")
         for field in (name, identity, level, meet, mission):
             field.setEnabled(not reservation)
-        consent = checked("I confirmed the student and obtained recording consent.")
-        fields = [("Student", name), ("Student ID", identity), ("Level", level), ("Meet", meet), ("Mission", mission),
-                  ("", consent)]
-        dialog = form_dialog(self, "Confirm lesson", fields, "Resume draft" if prior else "Open lesson")
+        consent = checked("My student agreed to recording.")
+        fields = [("Student", name), ("Level", level)]
+        learner = None
+        if not reservation and start:
+            learner = combo(["New student"])
+            known = {}
+            for old in self.store.sessions():
+                known.setdefault(old["student_id"], old)
+            names = [value["name"] for value in known.values()]
+            for key, old in sorted(known.items(), key=lambda item: item[1]["name"].casefold()):
+                display = old["name"]
+                learner.addItem(display if names.count(display) == 1 else f"{display} · {key[-6:]}", (key, display))
+
+            def pick_learner(_):
+                selected = learner.currentData()
+                name.setEnabled(selected is None)
+                if selected:
+                    level.setCurrentText(known[selected[0]]["level"])
+
+            learner.currentIndexChanged.connect(pick_learner)
+            fields.insert(0, ("Learner", learner))
+        elif not reservation:
+            fields.extend([("Student ID", identity), ("Meet", meet), ("Mission", mission)])
+        if room:
+            fields.append(("Meet", label(room)))
+        fields.append(("", consent))
+        action = "Start recording" if start and self.capture.recognizer and self.capture.mic else "Open lesson"
+        dialog = form_dialog(self, "Confirm your lesson", fields, "Resume draft" if prior and not start else action)
         if not dialog.exec():
             return
         if not consent.isChecked() or meet.text().strip() and not meet_code(meet.text().strip()):
             return self.notice("Confirm consent and use a standard Google Meet meeting link.")
         try:
+            selected = learner.currentData() if learner else None
+            student_id, display = selected if selected else (
+                identity.text() or ("local-" + str(uuid4()) if start else ""), name.text())
             lesson_id = prior["id"] if prior else self.store.create({
-                "student_id": identity.text(), "name": name.text(), "level": level.currentText(),
+                "student_id": student_id, "name": display, "level": level.currentText(),
                 "reservation_id": item.get("reservation_id"), "mission_id": mission.text() or None,
-                "meet_url": meet.text().strip() or None, "source": source, "adapter_url": adapter or None}, True)
-            self.open_lesson(lesson_id)
+                "meet_url": item.get("meet_url") if reservation else meet.text().strip() or None,
+                "source": source, "adapter_url": adapter or None}, True)
+            self.open_lesson(lesson_id, room)
+            if room and self.capture.snapshot()["meeting"] == room:
+                self.bound_meet = room
+                self.capture.select_meeting(room)
+            if action == "Start recording" and start:
+                self.toggle()
         except ValueError as error:
             self.notice(str(error))
 
@@ -430,7 +561,7 @@ class Studio(QMainWindow):
         self.refresh()
         self.home_refresh()
 
-    def open_lesson(self, key):
+    def open_lesson(self, key, room=None):
         if self.sample_id or self.capture.snapshot()["pending"] or "transcript" in self.jobs:
             return self.notice("Finish the current sample and wait for transcription before changing lessons.")
         if self.session_id != key and self.presentation:
@@ -440,12 +571,10 @@ class Studio(QMainWindow):
         self.session_id = key
         self.refresh()
         if changed:
-            self.bound_meet = meet_code(self.lesson.get("meet_url"))
+            self.bound_meet = meet_code(self.lesson.get("meet_url")) or room
         self.capture.select_meeting(self.bound_meet, reset=changed and not self.bound_meet)
-        if not self.demo and not self.lesson["approval"]:
+        if not self.demo and not self.lesson["approval"] and not self.capture.mic:
             self.apply_mic(preferred=self.store.settings("microphone"))
-        elif self.lesson["approval"]:
-            self.capture.stop_mic()
         self.navigate("Lesson Summary" if self.lesson["approval"] else "Live Studio")
 
     def draft(self):
@@ -469,11 +598,13 @@ class Studio(QMainWindow):
             return
         if not self.draft() or self.demo:
             return
+        if "reference" in self.jobs:
+            return self.notice("Wait for the sound check to finish.")
         if not self.reservation_valid():
             return self.notice("The current schedule no longer matches this reservation.")
         state = self.capture.snapshot()
         if not self.capture.recognizer or not state["tab"] or not state["mic"]:
-            return self.notice("Wait for the model and microphone, then connect the Meet tab using the pairing code.")
+            return self.notice("Wait for your mic and transcription, and allow audio on the Meet tab.")
         if not self.bound_meet:
             if not self.confirm(f'Confirm that Meet {state["meeting"]} contains only you and {self.lesson["name"]}.'):
                 return
@@ -511,15 +642,19 @@ class Studio(QMainWindow):
 
     def poll(self):
         state = self.capture.snapshot()
-        active = state["mode"] != "paused"
+        active = state["mode"] in ("assessment", "transcript")
+        solo = state["mode"] == "solo"
+        just_connected = state["tab"] and (not self.last_poll or not self.last_poll["tab"])
         if self.last_poll and (state["pending"], state["revision"]) != (self.last_poll["pending"], self.last_poll["revision"]):
             self.refresh()
         self.last_poll = state
         draft = self.draft() and not self.demo
-        self.trigger.setEnabled(draft and bool(self.capture.recognizer) and state["tab"] and state["mic"])
+        self.trigger.setEnabled(draft and not solo and "reference" not in self.jobs
+                                and bool(self.capture.recognizer) and state["tab"] and state["mic"])
         self.finish_button.setEnabled(bool(self.sample_id))
         self.activity.setEnabled(not self.sample_id)
-        status = {"paused": "PAUSED", "transcript": "●  RECORDING · TRANSCRIPT ONLY",
+        status = {"paused": "PAUSED", "solo": "● MIC TEST",
+                  "transcript": "●  RECORDING · TRANSCRIPT ONLY",
                   "assessment": "●  RECORDING · ASSESSMENT"}[state["mode"]]
         self.rail_status.setText(status)
         self.capture_state.setText(status)
@@ -527,14 +662,20 @@ class Studio(QMainWindow):
             self.trigger.setProperty("recording", active)
             self.trigger.style().unpolish(self.trigger)
             self.trigger.style().polish(self.trigger)
-        self.trigger.setText("Pause" if active else "Resume sample" if self.sample_id else "Start sample")
-        ready = f'{"Meet connected" if state["tab"] else "Meet disconnected"} · {"Microphone ready" if state["mic"] else "Microphone off"}'
-        if state["pending"]:
-            ready += f' · Processing {state["pending"]} audio block(s)'
-        self.capture_help.setText(state["failure"] or ready)
+        self.trigger.setText("Pause" if active else "Resume recording" if self.sample_id else "Start recording")
+        help_text = ("Recording. The student's words will appear after a brief pause." if active else
+                     "Allow Meet audio on the browser tab to start." if not state["tab"] else
+                     "Meet audio is connected. In a call alone, use the solo test or show your microphone.")
+        if state["pending"] and not active:
+            help_text = "Finishing the transcript…"
+        self.capture_help.setText(state["failure"] or help_text)
         self.provisional.setText("Live draft · " + state["preview"])
         self.provisional.setVisible(bool(state["preview"]))
-        self.home_readiness.setText(self.model_status + "  ·  " + ready + "  ·  " + self.integration_label())
+        self.ready_home(state)
+        self.ready_solo(state, solo, active)
+        if just_connected and (state["meeting"] == self.pending_meet or self.stack.currentIndex() == 0):
+            room, self.pending_meet = state["meeting"], None
+            QTimer.singleShot(0, lambda: self.meet_ready(room))
         for meter, key in zip(self.meters, ("student", "teacher")):
             meter.setValue(round(state[key] * 100))
         self.update_diagnostics()
@@ -544,12 +685,75 @@ class Studio(QMainWindow):
             self.toolbar_trigger.setEnabled(self.trigger.isEnabled())
             self.toolbar_finish.setEnabled(self.finish_button.isEnabled())
 
+    def ready_home(self, state):
+        if self.demo:
+            self.meet_home_state.setText("Fictional demonstration")
+            self.meet_action.setEnabled(False)
+        elif state["tab"]:
+            self.meet_home_state.setText("Meet audio is connected.")
+            self.meet_action.setText("Continue to lesson")
+        elif self.pending_meet and self.pending_meet in state["rooms"]:
+            self.meet_home_state.setText("In Chrome, click the Live Studio icon once to allow Meet audio.")
+            self.meet_action.setText("Show Meet tab")
+        elif state["rooms"]:
+            self.meet_home_state.setText("Meet tab found." if len(state["rooms"]) == 1
+                                         else f'{len(state["rooms"])} Meet tabs found.')
+            self.meet_action.setText("Connect Meet")
+        elif state["chrome"]:
+            self.meet_home_state.setText("Chrome is connected. Waiting for a Meet tab.")
+            self.meet_action.setText("Open Google Meet")
+        else:
+            self.meet_home_state.setText(state["bridge_error"] or self.bridge_status or
+                                         "Looking for the Chrome connector…")
+            self.meet_action.setText("Set up Chrome")
+        mic = state["mic_name"] or ("Unavailable" if state["mic_error"] else "Checking…")
+        speaker = state["speaker_name"] or "Windows default"
+        self.audio_home.setText(f"Microphone   {mic}\nSpeakers   {speaker}")
+        self.model_home.setText(self.model_status)
+
+    def ready_solo(self, state, solo, active):
+        self.solo_mic_status.setText(state["mic_name"] or state["mic_error"] or "Finding your microphone…")
+        busy = active or self.sample_id is not None or "reference" in self.jobs
+        self.solo_trigger.setEnabled(not self.demo and (solo or (
+            not busy and bool(self.capture.recognizer) and state["mic"] and not state["pending"])))
+        self.reference_trigger.setEnabled(not self.demo and not busy and not solo and
+                                          bool(self.capture.recognizer) and not state["pending"])
+        self.solo_trigger.setText("Stop mic test" if solo else "Start microphone test")
+        if self.solo_trigger.property("recording") != solo:
+            self.solo_trigger.setProperty("recording", solo)
+            self.solo_trigger.style().unpolish(self.solo_trigger)
+            self.solo_trigger.style().polish(self.solo_trigger)
+        self.solo_meter.setValue(round(state["teacher"] * 100) if solo else 0)
+        if not self.capture.recognizer:
+            self.solo_feedback.setText(self.model_status)
+        elif solo or self.solo_requested:
+            transcript = state["solo_text"]
+            if solo and state["preview"]:
+                transcript = (transcript + " " + state["preview"]).strip()
+            self.solo_transcript.setText(transcript or "Listening…" if solo else transcript or "No words heard.")
+            if state["failure"]:
+                hint = state["failure"]
+            elif state["pending"]:
+                hint = "Transcribing…"
+            elif transcript:
+                hint = "Your microphone and transcription are working."
+            elif solo and state["solo_voice"]:
+                hint = "Sound detected. Say a short English sentence, then pause."
+            elif solo:
+                hint = "Try saying “I can hear you clearly today.”"
+            else:
+                hint = "Try again and check that the microphone meter moves when you speak."
+            self.solo_feedback.setText(hint)
+        else:
+            self.solo_feedback.setText("Try saying “I can hear you clearly today.”")
+
     def refresh(self):
         if not self.session_id:
             self.lesson = None
         else:
             self.lesson = self.store.load(self.session_id)
         lesson = self.lesson
+        self.lesson_navigation()
         self.student_header.setText(f'{lesson["name"]}  ·  {lesson["level"]}' if lesson else "Open a lesson from Home")
         self.session_info.setText(("Approved" if lesson["approval"] else "Draft") +
                                   f'  ·  {lesson["mission_id"] or "Open speaking practice"}'
@@ -838,7 +1042,6 @@ class Studio(QMainWindow):
         try:
             self.store.approve(self.session_id, decision.currentText(), teacher.text(), note.toPlainText())
             self.store.configure("teacher", teacher.text().strip())
-            self.capture.stop_mic()
             self.refresh()
             self.sync()
         except ValueError as error:
@@ -955,20 +1158,71 @@ class Studio(QMainWindow):
         self.activateWindow()
         self.navigate("Live Studio")
 
-    def open_meet(self):
-        url = self.lesson.get("meet_url") if self.lesson else None
-        webbrowser.open(url if meet_code(url) else "https://meet.google.com/")
+    @staticmethod
+    def launch_chrome(url):
+        for directory in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"), os.environ.get("LOCALAPPDATA")):
+            if directory:
+                executable = Path(directory) / "Google" / "Chrome" / "Application" / "chrome.exe"
+                if executable.is_file():
+                    subprocess.Popen([str(executable), url])
+                    return
+        webbrowser.open(url)
 
-    def open_extension(self):
-        os.startfile(self.root / "extension")
+    def chrome_setup(self):
+        folder = str(self.root / "extension")
+        QApplication.clipboard().setText(folder)
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Connect Chrome once")
+        dialog.setText("Set up the Live Studio connector in Chrome")
+        dialog.setInformativeText("1. Open Chrome Extensions and turn on Developer mode.\n"
+                                  "2. Choose Load unpacked and paste the copied folder path.\n"
+                                  "3. Pin Live Studio from the Chrome Extensions menu.")
+        launch = dialog.addButton("Open Chrome Extensions", QMessageBox.ButtonRole.AcceptRole)
+        dialog.addButton("Close", QMessageBox.ButtonRole.RejectRole)
+        dialog.exec()
+        if dialog.clickedButton() == launch:
+            self.launch_chrome("chrome://extensions/")
 
-    def copy_code(self):
+    def meet_flow(self):
         if self.demo:
             return
-        clipboard = QApplication.clipboard()
-        clipboard.setText(self.capture.token)
-        QTimer.singleShot(60000, lambda: clipboard.clear() if clipboard.text() == self.capture.token else None)
-        self.statusBar().showMessage("Pairing code copied. Paste it into the Chrome extension.", 5000)
+        if self.capture.snapshot()["mode"] == "solo":
+            self.capture.pause()
+        state = self.capture.snapshot()
+        if state["tab"]:
+            self.meet_ready(state["meeting"])
+        elif state["rooms"]:
+            recommended = meet_code(self.recommended.get("meet_url")) if self.recommended else None
+            preferred = self.bound_meet or recommended
+            if preferred in state["rooms"]:
+                room = preferred
+            elif len(state["rooms"]) == 1:
+                room = state["rooms"][0]
+            else:
+                room, chosen = QInputDialog.getItem(self, "Choose a Meet tab", "Meeting code", state["rooms"], editable=False)
+                if not chosen:
+                    return
+            self.pending_meet = room
+            self.capture.focus_meeting(room)
+            self.poll()
+        elif state["chrome"]:
+            url = self.lesson.get("meet_url") if self.draft() else None
+            self.launch_chrome(url or "https://meet.google.com/")
+        else:
+            self.chrome_setup()
+
+    def meet_ready(self, room):
+        if self.capture.snapshot()["meeting"] != room:
+            return
+        if self.draft() and self.bound_meet == room:
+            self.navigate("Live Studio")
+            return
+        if self.sample_id or self.capture.snapshot()["pending"]:
+            return
+        self.raise_()
+        self.activateWindow()
+        matched = [item for item in upcoming(self.reservations) if meet_code(item.get("meet_url")) == room]
+        self.identity(matched[0] if len(matched) == 1 else {}, room=room, start=True)
 
     def background_job(self, name, operation):
         if name in self.jobs:
@@ -986,16 +1240,25 @@ class Studio(QMainWindow):
         Thread(target=perform, daemon=True, name=f"Studio {name}").start()
         return True
 
-    def load_model(self, download=False):
+    def load_model(self, download=False, automatic=False):
         if self.demo:
             return
-        if self.sample_id or self.capture.snapshot()["pending"]:
+        if self.sample_id or self.capture.snapshot()["mode"] != "paused" or self.capture.snapshot()["pending"] or "reference" in self.jobs:
             return self.notice("Finish the sample before changing the model.")
         model, device = self.model_choice.currentText(), self.compute.currentText()
-        if self.background_job("model", lambda: Recognizer(model, device, str(self.data / "models"),
-                                                          self.existing_models(), download)):
+        def load():
+            cache, existing = str(self.data / "models"), self.existing_models()
+            if not automatic:
+                return Recognizer(model, device, cache, existing, download)
+            try:
+                return Recognizer(model, device, cache, existing)
+            except (OSError, RuntimeError, ValueError):
+                return Recognizer("base.en", "cpu", cache, existing, download=True)
+
+        if self.background_job("model", load):
             self.capture.recognizer = None
-            self.model_status = "Downloading or preloading model…" if download else "Preloading the local model…"
+            self.model_retry.hide()
+            self.model_status = "Getting transcription ready. First use may download the speech model…"
             self.store.configure("model", model)
             self.store.configure("device", device)
 
@@ -1006,12 +1269,18 @@ class Studio(QMainWindow):
     def apply_mic(self, _=False, preferred=None):
         if self.demo:
             return
-        selected = preferred or self.mic_choice.currentText()
+        selected = preferred or (self.store.settings("microphone") if self.mic_choice.count() == 1 else None) or self.mic_choice.currentText()
         if selected == "Windows default":
             selected = None
         self.store.configure("microphone", selected)
-        if self.draft():
-            self.capture.microphone_worker(selected)
+        self.capture.microphone_worker(selected)
+
+    def recover_mic(self):
+        preferred = self.store.settings("microphone")
+        if self.capture.snapshot()["mode"] == "paused":
+            if not self.capture.mic and (not self.capture.mic_task or not self.capture.mic_task.is_alive()):
+                self.capture.microphone_worker(preferred)
+            self.background_job("endpoints", lambda: self.capture.default_endpoints(preferred))
 
     def import_schedule(self):
         path, _ = QFileDialog.getOpenFileName(self, "Import reservations", "", "JSON (*.json)")
@@ -1062,12 +1331,25 @@ class Studio(QMainWindow):
         self.jobs.discard(name)
         if name == "model":
             if error:
-                self.model_status = "Model unavailable. Open Settings to download it or select CPU."
+                self.model_status = "Transcription unavailable. Retry with an internet connection."
+                self.model_retry.show()
                 self.model_detail = str(error).splitlines()[0][:240]
             else:
                 self.capture.recognizer = result
-                self.model_status = f"{result.model} ready · {result.device.upper()}"
-                self.model_detail = f"Model warmup completed in {result.load_seconds:.2f} seconds."
+                self.model_status = "Transcription ready"
+                self.model_detail = f"{result.model} · {result.device.upper()} · {result.load_seconds:.2f} s warmup"
+        elif name == "chrome":
+            self.bridge_status = ("Chrome connection setup failed. Check the Windows connector." if error else
+                                  "Open Chrome with the Live Studio connector enabled.")
+        elif name == "endpoints" and not error:
+            expected, speaker = result
+            self.capture.speaker = speaker
+            if self.detected_mic and expected and expected != self.detected_mic and self.capture.snapshot()["mode"] == "paused":
+                self.capture.microphone_worker(self.store.settings("microphone"))
+            self.detected_mic = expected
+        elif name == "reference":
+            self.reference_status.setText(f'Heard on the test recording · {result}' if result else
+                                          "The test sentence could not be played or transcribed. Check the speaker volume.")
         elif name == "microphones":
             if error:
                 self.notice("Windows audio devices could not be enumerated.")

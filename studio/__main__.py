@@ -8,6 +8,7 @@ from PySide6.QtCore import QLockFile
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .capture import Capture
+from .chrome import publish_key, remove_key
 from .store import Store
 from .theme import STYLE
 from .window import Studio
@@ -36,19 +37,24 @@ def main():
     if not args.demo:
         try:
             capture.server_start()
+            publish_key(data, capture.token)
         except OSError:
-            capture.bridge_error = "Local port 18763 is unavailable. Close the other process and restart."
+            capture.bridge_error = ("Close the other Studio process and restart." if not capture.server else
+                                    "Windows could not save the Chrome connection key.")
     window = Studio(store, capture, data, ROOT, args.demo)
     if args.demo:
         from .demo import populate
         lesson = populate(store)
         window.open_lesson(lesson)
     window.show()
-    result = app.exec()
-    lock.unlock()
-    if temporary:
-        temporary.cleanup()
-    return result
+    try:
+        return app.exec()
+    finally:
+        if not args.demo:
+            remove_key(data, capture.token)
+        lock.unlock()
+        if temporary:
+            temporary.cleanup()
 
 
 if __name__ == "__main__":
